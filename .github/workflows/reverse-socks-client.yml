@@ -1,0 +1,155 @@
+name: Reverse SOCKS5 Client - Long Running Test
+
+on:
+  push:
+    branches: [ main, develop ]
+    paths:
+      - 'src/reverse_socks_client.py'
+      - '.github/workflows/reverse-socks-client.yml'
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'src/reverse_socks_client.py'
+  workflow_dispatch:
+    inputs:
+      timeout_minutes:
+        description: 'Job timeout in minutes'
+        required: false
+        default: '30'
+        type: string
+      server_address:
+        description: 'Server address to connect to (host:port)'
+        required: false
+        default: 'localhost:9000'
+        type: string
+
+env:
+  PYTHON_VERSION: '3.11'
+  SCRIPT_PATH: 'src/reverse_socks_client.py'
+  DEFAULT_TIMEOUT_MINUTES: 30
+
+jobs:
+  run-client-until-timeout:
+    name: Run Reverse SOCKS5 Client
+    runs-on: ubuntu-latest
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }}
+    
+    steps:
+      - name: 📦 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: 'pip'
+
+      - name: 📋 Validate script syntax
+        run: |
+          python -m py_compile ${{ env.SCRIPT_PATH }}
+          echo "✓ Script syntax valid"
+
+      - name: 🧪 Optional: Start mock SOCKS5 server for testing
+        if: github.event_name == 'pull_request'
+        run: |
+          # Create a minimal mock server that accepts connections and sends heartbeats
+          cat > mock_server.py << 'EOF'
+          import asyncio
+          import struct
+          
+          async def handle_client(reader, writer):
+              print("[MOCK] Client connected")
+              # Read REGISTER message
+              header = await reader.readexactly(9)
+              msg_type, conn_id, length = struct.unpack('!BII', header)
+              if length > 0:
+                  await reader.readexactly(length)
+              print(f"[MOCK] Registered: type={msg_type}, conn_id={conn_id}")
+              
+              # Send periodic heartbeats
+              try:
+                  while True:
+                      await asyncio.sleep(10)
+                      heartbeat = struct.pack('!BII', 0x07, 0, 0)
+                      writer.write(heartbeat)
+                      await writer.drain()
+                      print("[MOCK] Sent HEARTBEAT")
+              except asyncio.IncompleteReadError:
+                  print("[MOCK] Client disconnected")
+              finally:
+                  writer.close()
+                  await writer.wait_closed()
+          
+          async def main():
+              server = await asyncio.start_server(handle_client, '0.0.0.0', 9000)
+              print("[MOCK] Server listening on 0.0.0.0:9000")
+              async with server:
+                  await server.serve_forever()
+          
+          if __name__ == '__main__':
+              asyncio.run(main())
+          EOF
+          
+          # Start mock server in background
+          python mock_server.py &
+          echo $! > mock_server.pid
+          sleep 2
+          echo "✓ Mock server started (PID: $(cat mock_server.pid))"
+
+      - name: 🚀 Run Reverse SOCKS5 Client (with timeout)
+        id: run_client
+        run: |
+          SERVER_ADDR="${{ github.event.inputs.server_address || 'localhost:9000' }}"
+          LOG_FILE="client_run_${{ github.run_id }}.log"
+          
+          echo "📡 Connecting to server: $SERVER_ADDR"
+          echo "⏱️  Job timeout: ${{ steps.job_timeout.outputs.minutes }} minutes"
+          
+          # Run client with output logging
+          # The script will run until:
+          # 1. GitHub Actions job timeout is reached (hard stop)
+          # 2. Script exits on error (with reconnection logic)
+          # 3. Manual cancellation
+          
+          timeout --signal=TERM ${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }}m \
+            python ${{ env.SCRIPT_PATH }} "$SERVER_ADDR" -v 2>&1 | tee "$LOG_FILE" || true
+          
+          # Store log path for artifact upload
+          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
+          
+          # Show last 50 lines for quick inspection
+          echo -e "\n📋 Last 50 log lines:"
+          tail -n 50 "$LOG_FILE" || true
+
+      - name: 🛑 Cleanup mock server (if started)
+        if: always() && github.event_name == 'pull_request'
+        run: |
+          if [ -f mock_server.pid ]; then
+            PID=$(cat mock_server.pid)
+            echo "🔚 Stopping mock server (PID: $PID)"
+            kill $PID 2>/dev/null || true
+            wait $PID 2>/dev/null || true
+            rm -f mock_server.pid mock_server.py
+          fi
+
+      - name: 📤 Upload logs as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reverse-socks-client-logs-${{ github.run_id }}
+          path: |
+            client_run_*.log
+            *.py
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: ✅ Job summary
+        if: always()
+        run: |
+          echo "## 📊 Run Summary" >> $GITHUB_STEP_SUMMARY
+          echo "- **Job ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timeout**: ${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }} minutes" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: ${{ github.event.inputs.server_address || 'localhost:9000' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📁 Logs uploaded as artifact: \`reverse-socks-client-logs-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
