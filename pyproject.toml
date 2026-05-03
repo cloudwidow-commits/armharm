@@ -1,0 +1,9 @@
+# pyproject.toml
+[project]
+name = "reverse-socks-client"
+version = "0.1.0"
+requires-python = ">=3.8"
+dependencies = []
+
+[project.scripts]
+reverse-socks = "src.reverse_socks_client:main"
