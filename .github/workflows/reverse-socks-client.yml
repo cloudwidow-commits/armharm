@@ -26,13 +26,13 @@ on:
 env:
   PYTHON_VERSION: '3.11'
   SCRIPT_PATH: 'src/reverse_socks_client.py'
-  DEFAULT_TIMEOUT_MINUTES: 30
 
 jobs:
   run-client-until-timeout:
     name: "Run Reverse SOCKS5 Client"
     runs-on: ubuntu-latest
-    timeout-minutes: ${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }}
+    # ✅ FIX: Use simple numeric fallback - no env.* in timeout-minutes
+    timeout-minutes: ${{ github.event.inputs.timeout_minutes && fromJSON(github.event.inputs.timeout_minutes) || 30 }}
     
     steps:
       - name: "Checkout repository"
@@ -94,14 +94,16 @@ jobs:
       - name: "Run Reverse SOCKS5 Client with timeout"
         id: run_client
         run: |
+          # ✅ FIX: Handle timeout fallback in shell, not in workflow expression
+          TIMEOUT_INPUT="${{ github.event.inputs.timeout_minutes }}"
+          TIMEOUT_MINS="${TIMEOUT_INPUT:-30}"
           SERVER_ADDR="${{ github.event.inputs.server_address || 'localhost:9000' }}"
           LOG_FILE="client_run_${{ github.run_id }}.log"
-          TIMEOUT_MINS="${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }}"
           
           echo "Connecting to server: $SERVER_ADDR"
           echo "Job timeout: $TIMEOUT_MINS minutes"
           
-          # Run client - will exit on timeout signal or natural termination
+          # Run client - timeout command handles graceful shutdown
           timeout --signal=TERM "${TIMEOUT_MINS}m" \
             python ${{ env.SCRIPT_PATH }} "$SERVER_ADDR" -v 2>&1 | tee "$LOG_FILE" || true
           
@@ -136,10 +138,14 @@ jobs:
       - name: "Job summary"
         if: always()
         run: |
+          TIMEOUT_INPUT="${{ github.event.inputs.timeout_minutes }}"
+          TIMEOUT_MINS="${TIMEOUT_INPUT:-30}"
+          SERVER_ADDR="${{ github.event.inputs.server_address || 'localhost:9000' }}"
+          
           echo "## Run Summary" >> $GITHUB_STEP_SUMMARY
           echo "- **Job ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timeout**: ${{ github.event.inputs.timeout_minutes || env.DEFAULT_TIMEOUT_MINUTES }} minutes" >> $GITHUB_STEP_SUMMARY
-          echo "- **Server**: ${{ github.event.inputs.server_address || 'localhost:9000' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Timeout**: $TIMEOUT_MINS minutes" >> $GITHUB_STEP_SUMMARY
+          echo "- **Server**: $SERVER_ADDR" >> $GITHUB_STEP_SUMMARY
           echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "Logs uploaded as artifact: \`reverse-socks-client-logs-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
