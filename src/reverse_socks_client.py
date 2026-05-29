@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """
-Reverse SOCKS5 Proxy Client (Standalone)
-
-This client connects outbound to a server and handles actual destination connections.
-Traffic from the server's SOCKS5 interface is tunneled through this client.
+Reverse SOCKS5 Proxy Client (Standalone) - Control Tunnel TLS Mode
+Optimized for Terminated TLS / VPN environments like Tailscale.
 """
 import asyncio
 import argparse
 import logging
 import socket
 import struct
+import ssl
 from enum import IntEnum
 from typing import Dict, Optional, Tuple
 
@@ -72,11 +71,11 @@ class TunnelConnection:
         self.writer = writer
         self.closed = False
 
-
 class ReverseClient:
-    def __init__(self, server_host: str, server_port: int):
+    def __init__(self, server_host: str, server_port: int, ssl_context: Optional[ssl.SSLContext] = None):
         self.server_host = server_host
         self.server_port = server_port
+        self.ssl_context = ssl_context
         self.server_reader: Optional[asyncio.StreamReader] = None
         self.server_writer: Optional[asyncio.StreamWriter] = None
         self.tunnels: Dict[int, TunnelConnection] = {}
@@ -87,12 +86,12 @@ class ReverseClient:
     async def connect_to_server(self):
         while self.running:
             try:
-                logger.info(f"Connecting to server {self.server_host}:{self.server_port}")
+                logger.info(f"Connecting to reverse server {self.server_host}:{self.server_port} via TLS")
                 self.server_reader, self.server_writer = await asyncio.open_connection(
-                    self.server_host, self.server_port
+                    self.server_host, self.server_port, ssl=self.ssl_context
                 )
                 await write_message(self.server_writer, MessageType.REGISTER, 0, b'client')
-                logger.info("Connected and registered with server")
+                logger.info("Connected and registered with server (TLS Control Tunnel Active)")
                 await self.handle_server_messages()
             except Exception as e:
                 logger.error(f"Server connection error: {e}")
@@ -139,21 +138,17 @@ class ReverseClient:
                 async with self.write_lock:
                     await write_message(self.server_writer, MessageType.CONNECT_REPLY, conn_id, b'\x00')
                 asyncio.create_task(self.forward_from_target(tunnel))
-                logger.info(f"Connection {conn_id} established to {addr}:{port}")
+                logger.info(f"Connection {conn_id} established to local target {addr}:{port}")
             except asyncio.TimeoutError:
                 logger.warning(f"Connection {conn_id} to {addr}:{port} timed out")
                 async with self.write_lock:
                     await write_message(self.server_writer, MessageType.CONNECT_REPLY, conn_id, b'\x04')
             except OSError as e:
                 logger.warning(f"Connection {conn_id} to {addr}:{port} failed: {e}")
-                if e.errno in (111, 10061):
-                    reply = b'\x05'
-                elif e.errno in (113, 10065):
-                    reply = b'\x04'
-                elif e.errno in (101, 10051):
-                    reply = b'\x03'
-                else:
-                    reply = b'\x01'
+                reply = b'\x01'
+                if e.errno in (111, 10061): reply = b'\x05'
+                elif e.errno in (113, 10065): reply = b'\x04'
+                elif e.errno in (101, 10051): reply = b'\x03'
                 async with self.write_lock:
                     await write_message(self.server_writer, MessageType.CONNECT_REPLY, conn_id, reply)
         except Exception as e:
@@ -161,8 +156,7 @@ class ReverseClient:
             try:
                 async with self.write_lock:
                     await write_message(self.server_writer, MessageType.CONNECT_REPLY, conn_id, b'\x01')
-            except:
-                pass
+            except: pass
 
     async def forward_from_target(self, tunnel: TunnelConnection):
         try:
@@ -185,13 +179,11 @@ class ReverseClient:
             try:
                 tunnel.writer.close()
                 await tunnel.writer.wait_closed()
-            except:
-                pass
+            except: pass
             try:
                 async with self.write_lock:
                     await write_message(self.server_writer, MessageType.CLOSE, conn_id)
-            except:
-                pass
+            except: pass
             logger.debug(f"Tunnel {conn_id} closed")
 
     async def heartbeat_loop(self):
@@ -201,11 +193,10 @@ class ReverseClient:
                 try:
                     async with self.write_lock:
                         await write_message(self.server_writer, MessageType.HEARTBEAT, 0)
-                except:
-                    pass
+                except: pass
 
     async def start(self):
-        logger.info(f"Starting reverse SOCKS5 client")
+        logger.info(f"Starting reverse SOCKS5 client (TLS Control Link)")
         logger.info(f"Server: {self.server_host}:{self.server_port}")
         heartbeat_task = asyncio.create_task(self.heartbeat_loop())
         server_task = asyncio.create_task(self.connect_to_server())
@@ -216,27 +207,32 @@ class ReverseClient:
             heartbeat_task.cancel()
             server_task.cancel()
 
-
 DEFAULT_SERVER = 'localhost:9000'
 
 async def main():
-    parser = argparse.ArgumentParser(description='Reverse SOCKS5 Proxy Client')
+    parser = argparse.ArgumentParser(description='Reverse SOCKS5 Proxy Client (TLS Control Tunnel)')
     parser.add_argument('server', nargs='?', default=DEFAULT_SERVER, help='Server address (host:port)')
+    parser.add_argument('--insecure', action='store_true', help='Disable certificate verification')
     parser.add_argument('-v', '--verbose', action='store_true', help='Enable verbose logging')
     args = parser.parse_args()
+
     if args.verbose:
         logging.getLogger().setLevel(logging.DEBUG)
-    if args.server == DEFAULT_SERVER and len([a for a in __import__('sys').argv[1:] if not a.startswith('-')]) == 0:
-        logger.info(f"No server specified, using default: {DEFAULT_SERVER}")
+
+    ssl_context = ssl.create_default_context(ssl.Purpose.SERVER_AUTH)
+    if args.insecure:
+        ssl_context.check_hostname = False
+        ssl_context.verify_mode = ssl.CERT_NONE
+
     if ':' in args.server:
         host, port = args.server.rsplit(':', 1)
         port = int(port)
     else:
         host = args.server
         port = 9000
-    client = ReverseClient(host, port)
-    await client.start()
 
+    client = ReverseClient(host, port, ssl_context=ssl_context)
+    await client.start()
 
 if __name__ == '__main__':
     asyncio.run(main())
