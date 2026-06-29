@@ -1,39 +1,49 @@
-name: "Reverse SOCKS5 Client - Long Running Test"
+name: "Reverse SOCKS5 - Server/Client Test"
+
+# Runs the real reverse SOCKS5 server + client over a plain-TCP control link
+# (no TLS termination, no Tailscale). The client auto-detects the transport, so
+# no mode flag or coordination is needed. Two modes:
+#   * e2e   — short end-to-end SOCKS round-trip through the tunnel (default).
+#   * soak  — long-running stability run (workflow_dispatch only).
 
 on:
   push:
     branches: [ main, develop ]
     paths:
       - 'src/reverse_socks_client.py'
+      - 'src/reverse_socks_server.py'
       - '.github/workflows/reverse-socks-client.yml'
   pull_request:
     branches: [ main ]
     paths:
       - 'src/reverse_socks_client.py'
+      - 'src/reverse_socks_server.py'
   workflow_dispatch:
     inputs:
-      timeout_minutes:
-        description: 'Job timeout in minutes'
+      mode:
+        description: 'Test mode (e2e = quick round-trip, soak = long run)'
+        required: false
+        default: 'e2e'
+        type: choice
+        options: [ 'e2e', 'soak' ]
+      soak_minutes:
+        description: 'Soak duration in minutes (used when mode=soak)'
         required: false
         default: '30'
-        type: string
-      server_address:
-        description: 'Server address to connect to (host:port)'
-        required: false
-        default: 'localhost:9000'
         type: string
 
 env:
   PYTHON_VERSION: '3.11'
-  SCRIPT_PATH: 'src/reverse_socks_client.py'
+  CLIENT_PATH: 'src/reverse_socks_client.py'
+  SERVER_PATH: 'src/reverse_socks_server.py'
 
 jobs:
-  run-client-until-timeout:
-    name: "Run Reverse SOCKS5 Client"
+  end-to-end:
+    name: "End-to-end SOCKS5 over plain TCP"
     runs-on: ubuntu-latest
-    # ✅ FIX: Use simple numeric fallback - no env.* in timeout-minutes
-    timeout-minutes: ${{ github.event.inputs.timeout_minutes && fromJSON(github.event.inputs.timeout_minutes) || 30 }}
-    
+    if: github.event_name != 'workflow_dispatch' || github.event.inputs.mode != 'soak'
+    timeout-minutes: 5
+
     steps:
       - name: "Checkout repository"
         uses: actions/checkout@v4
@@ -42,110 +52,183 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: ${{ env.PYTHON_VERSION }}
-          cache: 'pip'
 
       - name: "Validate script syntax"
         run: |
-          python -m py_compile ${{ env.SCRIPT_PATH }}
+          python -m py_compile "$CLIENT_PATH" "$SERVER_PATH"
           echo "Script syntax valid"
 
-      - name: "Optional - Start mock SOCKS5 server for testing"
-        if: github.event_name == 'pull_request'
+      - name: "Run end-to-end plain-TCP SOCKS5 test"
         run: |
-          cat > mock_server.py << 'MOCKEOF'
-          import asyncio
-          import struct
-          
-          async def handle_client(reader, writer):
-              print("[MOCK] Client connected")
-              header = await reader.readexactly(9)
-              msg_type, conn_id, length = struct.unpack('!BII', header)
-              if length > 0:
-                  await reader.readexactly(length)
-              print(f"[MOCK] Registered: type={msg_type}, conn_id={conn_id}")
-              try:
-                  while True:
-                      await asyncio.sleep(10)
-                      heartbeat = struct.pack('!BII', 0x07, 0, 0)
-                      writer.write(heartbeat)
-                      await writer.drain()
-                      print("[MOCK] Sent HEARTBEAT")
-              except asyncio.IncompleteReadError:
-                  print("[MOCK] Client disconnected")
-              finally:
-                  writer.close()
-                  await writer.wait_closed()
-          
-          async def main():
-              server = await asyncio.start_server(handle_client, '0.0.0.0', 9000)
-              print("[MOCK] Server listening on 0.0.0.0:9000")
-              async with server:
-                  await server.serve_forever()
-          
-          if __name__ == '__main__':
-              asyncio.run(main())
-          MOCKEOF
-          
-          python mock_server.py &
-          echo $! > mock_server.pid
-          sleep 2
-          echo "Mock server started (PID: $(cat mock_server.pid))"
+          set -u
+          mkdir -p logs
 
-      - name: "Run Reverse SOCKS5 Client with timeout"
-        id: run_client
-        run: |
-          # ✅ FIX: Handle timeout fallback in shell, not in workflow expression
-          TIMEOUT_INPUT="${{ github.event.inputs.timeout_minutes }}"
-          TIMEOUT_MINS="${TIMEOUT_INPUT:-30}"
-          SERVER_ADDR="${{ github.event.inputs.server_address || 'localhost:9000' }}"
-          LOG_FILE="client_run_${{ github.run_id }}.log"
-          
-          echo "Connecting to server: $SERVER_ADDR"
-          echo "Job timeout: $TIMEOUT_MINS minutes"
-          
-          # Run client - timeout command handles graceful shutdown
-          timeout --signal=TERM "${TIMEOUT_MINS}m" \
-            python ${{ env.SCRIPT_PATH }} "$SERVER_ADDR" -v 2>&1 | tee "$LOG_FILE" || true
-          
-          echo "log_file=$LOG_FILE" >> $GITHUB_OUTPUT
-          
-          echo ""
-          echo "Last 50 log lines:"
-          tail -n 50 "$LOG_FILE" || true
+          # --- local HTTP origin the SOCKS tunnel will reach ---
+          python -m http.server 8080 --bind 127.0.0.1 > logs/origin.log 2>&1 &
+          ORIGIN_PID=$!
 
-      - name: "Cleanup mock server"
-        if: always() && github.event_name == 'pull_request'
-        run: |
-          if [ -f mock_server.pid ]; then
-            PID=$(cat mock_server.pid)
-            echo "Stopping mock server (PID: $PID)"
-            kill $PID 2>/dev/null || true
-            wait $PID 2>/dev/null || true
-            rm -f mock_server.pid mock_server.py
+          # --- reverse SOCKS5 server: control on 9000, SOCKS on 1080 ---
+          python "$SERVER_PATH" -c 9000 -s 1080 -v > logs/server.log 2>&1 &
+          SERVER_PID=$!
+
+          # --- reverse client (auto-detects plain TCP) ---
+          python "$CLIENT_PATH" localhost:9000 -v > logs/client.log 2>&1 &
+          CLIENT_PID=$!
+
+          cleanup() {
+            kill $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
+            wait $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          echo "Waiting for client to register with server..."
+          REGISTERED=0
+          for i in $(seq 1 30); do
+            if grep -q "registered" logs/server.log 2>/dev/null; then
+              REGISTERED=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$REGISTERED" -ne 1 ]; then
+            echo "::error::Client failed to register with server within 30s"
+            echo "----- server.log -----"; cat logs/server.log || true
+            echo "----- client.log -----"; cat logs/client.log || true
+            exit 1
           fi
+          echo "Client registered. Probing SOCKS5 round-trip..."
+
+          # --- actual SOCKS5 round-trip through the tunnel ---
+          OK=0
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 5 -x socks5h://127.0.0.1:1080 \
+                   http://127.0.0.1:8080/ -o /dev/null; then
+              OK=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$OK" -ne 1 ]; then
+            echo "::error::SOCKS5 round-trip through the tunnel failed"
+            echo "----- server.log -----"; cat logs/server.log || true
+            echo "----- client.log -----"; cat logs/client.log || true
+            exit 1
+          fi
+
+          echo "::notice::SOCKS5 round-trip OK (curl over socks5h://127.0.0.1:1080)"
+
+          echo "roundtrip=ok" >> "$GITHUB_OUTPUT"
+          {
+            echo "## End-to-end Result"
+            echo "- **Control link**: plain TCP (auto-detected by client)"
+            echo "- **Registration**: ok"
+            echo "- **SOCKS5 round-trip**: ok"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: "Upload logs as artifact"
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: "reverse-socks-client-logs-${{ github.run_id }}"
-          path: |
-            client_run_*.log
-            *.py
+          name: "reverse-socks-e2e-logs-${{ github.run_id }}"
+          path: logs/
           retention-days: 7
           if-no-files-found: warn
 
-      - name: "Job summary"
-        if: always()
+  soak:
+    name: "Long-running soak (plain TCP)"
+    runs-on: ubuntu-latest
+    if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'soak'
+    timeout-minutes: ${{ (github.event.inputs.soak_minutes && (fromJSON(github.event.inputs.soak_minutes) + 5)) || 35 }}
+
+    steps:
+      - name: "Checkout repository"
+        uses: actions/checkout@v4
+
+      - name: "Set up Python"
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: "Validate script syntax"
         run: |
-          TIMEOUT_INPUT="${{ github.event.inputs.timeout_minutes }}"
-          TIMEOUT_MINS="${TIMEOUT_INPUT:-30}"
-          SERVER_ADDR="${{ github.event.inputs.server_address || 'localhost:9000' }}"
-          
-          echo "## Run Summary" >> $GITHUB_STEP_SUMMARY
-          echo "- **Job ID**: ${{ github.run_id }}" >> $GITHUB_STEP_SUMMARY
-          echo "- **Timeout**: $TIMEOUT_MINS minutes" >> $GITHUB_STEP_SUMMARY
-          echo "- **Server**: $SERVER_ADDR" >> $GITHUB_STEP_SUMMARY
-          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Logs uploaded as artifact: \`reverse-socks-client-logs-${{ github.run_id }}\`" >> $GITHUB_STEP_SUMMARY
+          python -m py_compile "$CLIENT_PATH" "$SERVER_PATH"
+          echo "Script syntax valid"
+
+      - name: "Run long-running server + client"
+        run: |
+          set -u
+          mkdir -p logs
+
+          python -m http.server 8080 --bind 127.0.0.1 > logs/origin.log 2>&1 &
+          ORIGIN_PID=$!
+
+          python "$SERVER_PATH" -c 9000 -s 1080 -v > logs/server.log 2>&1 &
+          SERVER_PID=$!
+
+          python "$CLIENT_PATH" localhost:9000 -v > logs/client.log 2>&1 &
+          CLIENT_PID=$!
+
+          cleanup() {
+            kill $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
+            wait $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # Wait for the tunnel to come up, then verify it works before soaking.
+          echo "Waiting for client to register..."
+          REGISTERED=0
+          for i in $(seq 1 30); do
+            if grep -q "registered" logs/server.log 2>/dev/null; then
+              REGISTERED=1; break
+            fi
+            sleep 1
+          done
+          if [ "$REGISTERED" -ne 1 ]; then
+            echo "::error::Client failed to register"
+            cat logs/server.log logs/client.log 2>/dev/null || true
+            exit 1
+          fi
+          curl -fsS --max-time 5 -x socks5h://127.0.0.1:1080 http://127.0.0.1:8080/ -o /dev/null \
+            || { echo "::error::Initial SOCKS round-trip failed"; exit 1; }
+
+          SOAK_MINS="${SOAK_MINS:-30}"
+          echo "Tunnel up. Soaking for ${SOAK_MINS} minutes, probing every 60s..."
+          FAILS=0
+          PROBES=0
+          END=$(( $(date +%s) + SOAK_MINS * 60 ))
+          while [ "$(date +%s)" -lt "$END" ]; do
+            sleep 60
+            PROBES=$((PROBES + 1))
+            if curl -fsS --max-time 5 -x socks5h://127.0.0.1:1080 http://127.0.0.1:8080/ -o /dev/null; then
+              echo "[probe $PROBES] ok"
+            else
+              FAILS=$((FAILS + 1))
+              echo "[probe $PROBES] FAILED"
+            fi
+          done
+
+          echo "Soak complete: $PROBES probes, $FAILS failures"
+          {
+            echo "## Soak Result"
+            echo "- **Duration**: ${SOAK_MINS} minutes"
+            echo "- **Probes**: $PROBES"
+            echo "- **Failures**: $FAILS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$FAILS" -gt 0 ]; then
+            echo "::error::$FAILS probe(s) failed during soak"
+            exit 1
+          fi
+        env:
+          SOAK_MINS: ${{ github.event.inputs.soak_minutes }}
+
+      - name: "Upload logs as artifact"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "reverse-socks-soak-logs-${{ github.run_id }}"
+          path: logs/
+          retention-days: 7
+          if-no-files-found: warn
