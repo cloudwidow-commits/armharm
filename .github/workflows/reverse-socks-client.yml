@@ -1,10 +1,16 @@
 name: "Reverse SOCKS5 - Server/Client Test"
 
-# Runs the real reverse SOCKS5 server + client over a plain-TCP control link
-# (no TLS termination, no Tailscale). The client auto-detects the transport, so
-# no mode flag or coordination is needed. Two modes:
-#   * e2e   — short end-to-end SOCKS round-trip through the tunnel (default).
-#   * soak  — long-running stability run (workflow_dispatch only).
+# Runs the reverse SOCKS5 client/server over a plain-TCP control link (no TLS
+# termination, no Tailscale). The client auto-detects the transport, so no mode
+# flag or coordination is needed. Two modes (workflow_dispatch):
+#   * e2e   — short self-contained round-trip (server+client+origin on the
+#             runner, runs on push/PR too). Code-correctness check.
+#   * soak  — long-running stability run.
+#             - server_address given: CI runs the CLIENT ONLY, dialing out to
+#               your real plain-TCP server. Use this to keep a tunnel node up
+#               against a deployment you control.
+#             - server_address blank: falls back to self-contained (server +
+#               client + origin on the runner), probing the SOCKS port locally.
 
 on:
   push:
@@ -30,6 +36,11 @@ on:
         description: 'Soak duration in minutes (used when mode=soak)'
         required: false
         default: '30'
+        type: string
+      server_address:
+        description: 'External plain-TCP server for soak (host:port). Leave blank = self-contained local soak. Ignored unless mode=soak.'
+        required: false
+        default: ''
         type: string
 
 env:
@@ -159,27 +170,87 @@ jobs:
           python -m py_compile "$CLIENT_PATH" "$SERVER_PATH"
           echo "Script syntax valid"
 
-      - name: "Run long-running server + client"
+      - name: "Run long-running soak"
         run: |
           set -u
           mkdir -p logs
 
-          python -m http.server 8080 --bind 127.0.0.1 > logs/origin.log 2>&1 &
-          ORIGIN_PID=$!
-
-          python "$SERVER_PATH" -c 9000 -s 1080 -v > logs/server.log 2>&1 &
-          SERVER_PID=$!
-
-          python "$CLIENT_PATH" localhost:9000 -v > logs/client.log 2>&1 &
-          CLIENT_PID=$!
+          SERVER_ADDR="${SERVER_ADDR:-}"
+          SOAK_MINS="${SOAK_MINS:-30}"
+          CLIENT_PID=""
+          SERVER_PID=""
+          ORIGIN_PID=""
 
           cleanup() {
-            kill $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
-            wait $CLIENT_PID $SERVER_PID $ORIGIN_PID 2>/dev/null || true
+            [ -n "$CLIENT_PID" ] && kill "$CLIENT_PID" 2>/dev/null || true
+            [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
+            [ -n "$ORIGIN_PID" ] && kill "$ORIGIN_PID" 2>/dev/null || true
+            wait 2>/dev/null || true
           }
           trap cleanup EXIT
 
-          # Wait for the tunnel to come up, then verify it works before soaking.
+          END=$(( $(date +%s) + SOAK_MINS * 60 ))
+
+          if [ -n "$SERVER_ADDR" ]; then
+            # ---- External soak: client dials out to YOUR server (client-only) ----
+            echo "Soak target: external server $SERVER_ADDR (client-only)"
+            echo "Running client for ${SOAK_MINS} minutes; monitoring control-link health..."
+            python "$CLIENT_PATH" "$SERVER_ADDR" -v > logs/client.log 2>&1 &
+            CLIENT_PID=$!
+
+            # Must reach "registered" at least once, or the endpoint is unreachable.
+            REGISTERED=0
+            for i in $(seq 1 30); do
+              if grep -q "Connected and registered" logs/client.log 2>/dev/null; then
+                REGISTERED=1; break
+              fi
+              sleep 1
+            done
+            if [ "$REGISTERED" -ne 1 ]; then
+              echo "::error::Client never registered with $SERVER_ADDR within 30s"
+              cat logs/client.log 2>/dev/null || true
+              exit 1
+            fi
+            echo "Client registered with $SERVER_ADDR"
+
+            # Monitor: stay alive SOAK_MINS, flag if the link drops and never recovers.
+            OK=0; RECONNECTS=0; LAST_OK=$(date +%s)
+            while [ "$(date +%s)" -lt "$END" ]; do
+              if ! kill -0 "$CLIENT_PID" 2>/dev/null; then
+                echo "::error::Client process exited unexpectedly"
+                tail -n 30 logs/client.log 2>/dev/null || true
+                exit 1
+              fi
+              if grep -q "Connected and registered" logs/client.log 2>/dev/null \
+                 && tail -n 5 logs/client.log 2>/dev/null | grep -qiE "Reconnecting|connection closed|error"; then
+                RECONNECTS=$((RECONNECTS + 1))
+                echo "[watch] reconnect event #$RECONNECTS detected"
+              fi
+              sleep 60
+              if kill -0 "$CLIENT_PID" 2>/dev/null; then
+                OK=$((OK + 1)); LAST_OK=$(date +%s)
+                echo "[watch $(date +%H:%M)] alive (uptime ${OK}m)"
+              fi
+            done
+
+            {
+              echo "## Soak Result (external: $SERVER_ADDR)"
+              echo "- **Duration**: ${SOAK_MINS} minutes"
+              echo "- **Alive checks**: $OK"
+              echo "- **Reconnect events**: $RECONNECTS"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          # ---- Self-contained local soak (server + client + origin) ----
+          echo "Soak target: self-contained (no server_address given)"
+          python -m http.server 8080 --bind 127.0.0.1 > logs/origin.log 2>&1 &
+          ORIGIN_PID=$!
+          python "$SERVER_PATH" -c 9000 -s 1080 -v > logs/server.log 2>&1 &
+          SERVER_PID=$!
+          python "$CLIENT_PATH" localhost:9000 -v > logs/client.log 2>&1 &
+          CLIENT_PID=$!
+
           echo "Waiting for client to register..."
           REGISTERED=0
           for i in $(seq 1 30); do
@@ -196,11 +267,8 @@ jobs:
           curl -fsS --max-time 5 -x socks5h://127.0.0.1:1080 http://127.0.0.1:8080/ -o /dev/null \
             || { echo "::error::Initial SOCKS round-trip failed"; exit 1; }
 
-          SOAK_MINS="${SOAK_MINS:-30}"
           echo "Tunnel up. Soaking for ${SOAK_MINS} minutes, probing every 60s..."
-          FAILS=0
-          PROBES=0
-          END=$(( $(date +%s) + SOAK_MINS * 60 ))
+          FAILS=0; PROBES=0
           while [ "$(date +%s)" -lt "$END" ]; do
             sleep 60
             PROBES=$((PROBES + 1))
@@ -214,7 +282,7 @@ jobs:
 
           echo "Soak complete: $PROBES probes, $FAILS failures"
           {
-            echo "## Soak Result"
+            echo "## Soak Result (self-contained)"
             echo "- **Duration**: ${SOAK_MINS} minutes"
             echo "- **Probes**: $PROBES"
             echo "- **Failures**: $FAILS"
@@ -226,6 +294,7 @@ jobs:
           fi
         env:
           SOAK_MINS: ${{ github.event.inputs.soak_minutes }}
+          SERVER_ADDR: ${{ github.event.inputs.server_address }}
 
       - name: "Upload logs as artifact"
         if: always()
