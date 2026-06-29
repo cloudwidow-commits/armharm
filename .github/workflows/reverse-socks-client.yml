@@ -140,7 +140,10 @@ jobs:
     name: "Long-running soak (plain TCP)"
     runs-on: ubuntu-latest
     if: github.event_name == 'workflow_dispatch' && github.event.inputs.mode == 'soak'
-    timeout-minutes: ${{ (github.event.inputs.soak_minutes && (fromJSON(github.event.inputs.soak_minutes) + 5)) || 35 }}
+    # GitHub Actions expressions don't support arithmetic, so use a generous flat
+    # ceiling. The soak loop itself ends on time (it watches the wall clock); this
+    # is just a safety net. Raise it if you run very long soaks.
+    timeout-minutes: 360
 
     steps:
       - name: "Checkout repository"
